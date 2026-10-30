@@ -1,47 +1,53 @@
 import requests
-from bs4 import BeautifulSoup
 import boto3
 import uuid
+import json
+from decimal import Decimal
+from datetime import datetime
 
 def lambda_handler(event, context):
-    # URL de la pagina del IGP con los reportes sismicos
-    url = "https://ultimosismo.igp.gob.pe/productos/reportes-sismicos"
+    # Endpoint JSON que usa la pagina del IGP (se encontro en F12 > Network)
+    anio = datetime.now().year
+    url = f"https://ultimosismo.igp.gob.pe/api/ultimo-sismo/ajaxb/{anio}"
 
-    # Realizar la solicitud HTTP a la pagina web
+    # Realizar la solicitud HTTP al IGP
     response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
     if response.status_code != 200:
         return {
             'statusCode': response.status_code,
-            'body': 'Error al acceder a la pagina web'
+            'body': 'Error al acceder al IGP'
         }
 
-    # Parsear el contenido HTML de la pagina web
-    soup = BeautifulSoup(response.content, 'html.parser')
-
-    # Encontrar la tabla en el HTML
-    table = soup.find('table')
-    if not table:
+    datos = response.json()
+    if not isinstance(datos, list) or len(datos) == 0:
         return {
             'statusCode': 404,
-            'body': 'No se encontro la tabla en la pagina web'
+            'body': 'No se encontraron sismos en la respuesta del IGP'
         }
 
-    # Extraer los encabezados de la tabla
-    headers = [th.get_text(strip=True) for th in table.find_all('th')]
+    # El IGP entrega los sismos del mas antiguo al mas reciente:
+    # se ordenan de mas reciente a mas antiguo y se toman los 10 ultimos
+    datos.sort(key=lambda s: s['idlistasismos'], reverse=True)
+    ultimos = datos[:10]
 
-    # Extraer las filas de la tabla (solo los 10 ultimos sismos)
-    rows = []
-    for tr in table.find_all('tr'):
-        cells = tr.find_all('td')
-        if not cells:  # Omitir la fila de encabezado
-            continue
-        fila = {}
-        for i, cell in enumerate(cells):
-            nombre = headers[i] if i < len(headers) and headers[i] else f"columna_{i+1}"
-            fila[nombre] = cell.get_text(strip=True)
-        rows.append(fila)
-        if len(rows) == 10:
-            break
+    # Quedarse con los campos utiles y dar formato a fecha y hora
+    sismos = []
+    for i, s in enumerate(ultimos, start=1):
+        sismos.append({
+            '#': i,
+            'codigo': s['codigo'],
+            'fecha_local': s['fecha_local'][:10],
+            'hora_local': s['hora_local'][11:19],
+            'fecha_utc': s['fecha_utc'][:10],
+            'hora_utc': s['hora_utc'][11:19],
+            'referencia': s['referencia'],
+            'magnitud': s['magnitud'],
+            'profundidad': s['profundidad'],
+            'latitud': s['latitud'],
+            'longitud': s['longitud'],
+            'intensidad': s['intensidad'],
+            'reporte_pdf': s['reporte_acelerometrico_pdf']
+        })
 
     # Guardar los datos en DynamoDB
     dynamodb = boto3.resource('dynamodb')
@@ -54,15 +60,12 @@ def lambda_handler(event, context):
             batch.delete_item(Key={'id': each['id']})
 
     # Insertar los nuevos datos
-    i = 1
-    for row in rows:
-        row['#'] = i
-        row['id'] = str(uuid.uuid4())  # ID unico para cada sismo
-        tabla.put_item(Item=row)
-        i = i + 1
+    for sismo in sismos:
+        sismo['id'] = str(uuid.uuid4())  # ID unico para cada sismo
+        tabla.put_item(Item=sismo)
 
     # Retornar el resultado como JSON
     return {
         'statusCode': 200,
-        'body': rows
+        'body': sismos
     }
